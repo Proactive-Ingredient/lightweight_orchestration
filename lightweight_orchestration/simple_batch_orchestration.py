@@ -8,12 +8,14 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-class SimpleJobOrchestrator:
+class SimpleBatchOrchestrator:
     INITIAL_TASK = '_START_'
+    KILL_SIGNAL = '_KILL_'
+    NORMAL_END_SIGNAL = '_NORMAL_END_'
 
     def __init__(self, 
                  task_dag = {INITIAL_TASK: None},
-                 task_execution_threads = 3,
+                 task_execution_threads = 10,
                  task_wait_timeout = 1,
                  log_level_to_console = logging.INFO,
                  log_level_to_file = logging.DEBUG,
@@ -47,7 +49,7 @@ class SimpleJobOrchestrator:
         self.successful_result_queue = queue.Queue()
         self.exception_queue = queue.Queue()
 
-        self.logger.debug(f"SimpleJobOrchestrator: Initializing instance with {self.task_execution_threads} threads, {self.task_wait_timeout} timeout, and the following Task DAG:")
+        self.logger.debug(f"SimpleBatchOrchestrator: Initializing instance with {self.task_execution_threads} threads, {self.task_wait_timeout} timeout, and the following Task DAG:")
         for key, value in self.task_dag.items():
             self.logger.debug(f"\t Task {key} ==> {value}")
 
@@ -76,11 +78,19 @@ class SimpleJobOrchestrator:
                     if next_func not in task_dag:
                         self.logger.warning(f"Task '{next_func}' in 'next_tasks' of '{key}' is not defined in the DAG.")
 
+        # Start a fixed number of threads to process the queue
+        self.threads = []
+        for i in range(self.task_execution_threads):
+            thread = threading.Thread(target=self.run_job_thread, name=f"Thread-{i+1}")
+            thread.start()
+            self.threads.append(thread)
+            self.logger.debug(f"SimpleBatchOrchestrator: Started {thread.name}")
+
 
     def run_job(self, **kwargs):
         job_start_timestamp = datetime.now(timezone.utc).isoformat()
         job_uuid = str(uuid.uuid4())
-        self.logger.debug(f"SimpleJobOrchestrator job {job_uuid} starting at {job_start_timestamp} UTC.")
+        self.logger.debug(f"SimpleBatchOrchestrator job {job_uuid} starting at {job_start_timestamp} UTC.")
         
         # Add job_start_timestamp and job_uuid to the parameters
         kwargs = kwargs.copy()  # Make a shallow copy of the parameters before adding anything to them
@@ -93,37 +103,12 @@ class SimpleJobOrchestrator:
             for next_func in self.task_dag[self.INITIAL_TASK]["next_tasks"]:
                 initial_task_info = (next_func, serialized_params)
                 self.task_queue.put(initial_task_info)
-                self.logger.debug(f"SimpleJobOrchestrator job {job_uuid} enqueued task: {next_func}")
-
-        # Start threads to process the queue
-        threads = []
-        for i in range(self.task_execution_threads):
-            thread = threading.Thread(target=self.run_job_thread, name=f"Job-{job_uuid}-Thread-{i+1}")
-            thread.start()
-            threads.append(thread)
-            self.logger.debug(f"SimpleJobOrchestrator job {job_uuid} starting new thread: {thread.name}")
-
-        # Wait for all threads to finish
-        for thread in threads:
-            thread.join()
-
-        # Collect results from queues and return as lists
-        success_result_list = []
-        exception_result_list = []
-        
-        while not self.successful_result_queue.empty():
-            success_result_list.append(self.successful_result_queue.get())
-
-        while not self.exception_queue.empty():
-            exception_result_list.append(self.exception_queue.get())
-
-        # Wrap up
-        self.logger.debug(f"SimpleJobOrchestrator job {job_uuid} completed!")
-        return success_result_list, exception_result_list
+                self.logger.debug(f"SimpleBatchOrchestrator job {job_uuid} enqueued task: {next_func}")
 
 
     def run_job_thread(self):
         time.sleep(0.1)
+        flg_exit_if_queue_is_empty = False
         while True:
             try:
                 # Initialize variables so they always exist
@@ -131,24 +116,36 @@ class SimpleJobOrchestrator:
                 task_info = None
 
                 # Retrieve the next item from the queue
-                task_info = self.task_queue.get(timeout = self.task_wait_timeout) # seconds
+                task_info = self.task_queue.get(timeout=self.task_wait_timeout)  # seconds
+
+                # Check for stop signals
+                if task_info == self.KILL_SIGNAL:
+                    self.logger.debug(f"SimpleBatchOrchestrator {current_thread.name}: Kill signal received. Exiting thread.")
+                    break
+                if task_info == self.NORMAL_END_SIGNAL:
+                    self.logger.debug(f"SimpleBatchOrchestrator {current_thread.name}: End signal received. Will exit thread when the queue is empty.")
+                    flg_exit_if_queue_is_empty = True
+                    continue
 
                 # Determine the type of task and execute it (for now, there is only one: function calling)
-                self.logger.debug(f"SimpleJobOrchestrator {current_thread.name}: New task found.")
+                self.logger.debug(f"SimpleBatchOrchestrator {current_thread.name}: New task found.")
                 self.run_task_function_call(task_info)
 
                 # Mark task as complete
                 self.task_queue.task_done()
 
             except queue.Empty:
-                self.logger.debug(f"SimpleJobOrchestrator {current_thread.name}: task queue is empty. Exiting thread.")
-                break
-
+                if flg_exit_if_queue_is_empty:
+                    self.logger.debug(f"SimpleBatchOrchestrator {current_thread.name}: Queue is empty. Exiting thread.")
+                    break
+                else:
+                    continue
+                    
             except Exception as e:
-                exception_message = f"SimpleJobOrchestrator {current_thread.name}: Unexpected error: {str(e)}. Ending Thread."
+                exception_message = f"SimpleBatchOrchestrator {current_thread.name}: Unexpected error: {str(e)}. Ending Thread."
                 self.exception_queue.put((task_info, exception_message, None))
                 self.logger.error(exception_message)
-                break # End thread but do not raise error
+                break  # End thread but do not raise error
 
 
     def run_task_function_call(self, task_info):
@@ -165,9 +162,9 @@ class SimpleJobOrchestrator:
             func = self.callable_functions[function_name]
             params = json.loads(serialized_params)
             params['_orchestrator_thread_name_'] = current_thread.name
-            self.logger.debug(f"SimpleJobOrchestrator {current_thread.name}: task processing function: {function_name}")
+            self.logger.debug(f"SimpleBatchOrchestrator {current_thread.name}: task processing function: {function_name}")
         except Exception as e:
-            exception_message = f"SimpleJobOrchestrator {current_thread.name}: task failed to retrieve or parse item from queue: {str(e)}"
+            exception_message = f"SimpleBatchOrchestrator {current_thread.name}: task failed to retrieve or parse item from queue: {str(e)}"
             self.exception_queue.put((task_info, exception_message, execution_details))
             self.logger.error(exception_message)
             return False
@@ -180,7 +177,7 @@ class SimpleJobOrchestrator:
             function_call_end_timestamp = datetime.now(timezone.utc).isoformat()
             function_call_duration = (time.time() - start_time) * 1000  # Duration in milliseconds
         except Exception as e:
-            exception_message = f"SimpleJobOrchestrator {current_thread.name}: Execution of task {function_name} failed: {str(e)}"
+            exception_message = f"SimpleBatchOrchestrator {current_thread.name}: Execution of task {function_name} failed: {str(e)}"
             execution_details = json.dumps({
                 "function_call_start_timestamp" : function_call_start_timestamp,
                 "function_call_end_timestamp"   : function_call_end_timestamp,
@@ -205,14 +202,31 @@ class SimpleJobOrchestrator:
                 for next_func in next_tasks:
                     new_task_info = (next_func, serialized_params)
                     self.task_queue.put(new_task_info)
-                    self.logger.debug(f"SimpleJobOrchestrator {current_thread.name}: Enqueued {next_func} as next task after {function_name}")
+                    self.logger.debug(f"SimpleBatchOrchestrator {current_thread.name}: Enqueued {next_func} as next task after {function_name}")
         except Exception as e:
-            exception_message = f"SimpleJobOrchestrator {current_thread.name}: Post-processing failed for task {function_name}: {str(e)}"
+            exception_message = f"SimpleBatchOrchestrator {current_thread.name}: Post-processing failed for task {function_name}: {str(e)}"
             self.exception_queue.put((task_info, exception_message, execution_details))
             self.logger.error(exception_message)
             return False
 
         # Success!
-        self.logger.debug(f"SimpleJobOrchestrator {current_thread.name}: Task {function_name} succesfully completed in {function_call_duration:.2f} ms.")
+        self.logger.debug(f"SimpleBatchOrchestrator {current_thread.name}: Task {function_name} successfully completed in {function_call_duration:.2f} ms.")
         return True
 
+
+    def kill_batch(self):
+        self.logger.debug(f"SimpleBatchOrchestrator: Killing all threads and discarding tasks in queue.")
+        for _ in range(self.task_execution_threads):
+            self.task_queue.put(self.KILL_SIGNAL)
+        for thread in self.threads:
+            thread.join()
+        self.logger.debug(f"SimpleBatchOrchestrator: All threads have been killed.")
+
+
+    def end_batch(self):
+        self.logger.debug(f"SimpleBatchOrchestrator: Ending batch when all tasks are complete.")
+        for _ in range(self.task_execution_threads):
+            self.task_queue.put(self.NORMAL_END_SIGNAL)
+        for thread in self.threads:
+            thread.join()
+        self.logger.debug(f"SimpleBatchOrchestrator: All tasks have completed and all threads have ended.")
